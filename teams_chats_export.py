@@ -242,13 +242,14 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
         return
 
     async def save_msg(msg: ChatMessage):
+        await download_hosted_content_in_msg(client, chat, msg, chat_dir)
+
         kiota_factory = kiota_serialization_json.json_serialization_writer_factory.JsonSerializationWriterFactory()
         kiota_writer = kiota_factory.get_serialization_writer(kiota_factory.get_valid_content_type())
         msg.serialize(kiota_writer)
 
         with open(path, "wb") as f:
             f.write(kiota_writer.get_serialized_content())
-        await download_hosted_content_in_msg(client, chat, msg, chat_dir)
 
     last_msg_id = chat.last_message_preview.id if chat.last_message_preview is not None else None
     last_msg_exists = os.path.exists(os.path.join(chat_dir, sanitize_filename(f"msg_{last_msg_id}.json")))
@@ -315,14 +316,17 @@ async def download_chat(client: GraphServiceClient, chat: Chat, data_dir: str, f
     chat_dir = os.path.join(data_dir, sanitize_filename(chat.id))
     makedir(chat_dir)
 
+    await download_messages(client, chat, chat_dir, force)
+
+    # Write a cache copy so we can tell if the chat has been updated since last run.
+    # We do this after downloading messages so if we're interrupted mid-download,
+    # we can start again.
     kiota_factory = kiota_serialization_json.json_serialization_writer_factory.JsonSerializationWriterFactory()
     kiota_writer = kiota_factory.get_serialization_writer(kiota_factory.get_valid_content_type())
     chat.serialize(kiota_writer)
 
     with open(f"{chat_dir}.json", "wb") as f:
         f.write(kiota_writer.get_serialized_content())
-
-    await download_messages(client, chat, chat_dir, force)
 
 
 async def download_all(output_dir: str, force: bool):
