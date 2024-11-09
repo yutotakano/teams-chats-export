@@ -33,7 +33,6 @@ client_id = os.getenv("CLIENT_ID")
 
 filename_size_limit = 255
 
-
 def makedir(path: str):
     """basically mkdir -p"""
     if not os.path.exists(path):
@@ -188,19 +187,28 @@ async def download_sharepoint_document(client: GraphServiceClient, url: str, cha
     except APIError as e:
         # If the sharing link no longer exists, just warn and continue, can't do
         # anything about it
-        if "error" in e and "The sharing link no longer exists" in e.error.message:
-            print(f"Warn: The sharing link for {url} no longer exists")
+        if e.message and "The sharing link no longer exists" in e.message:
+            print(f"  Warn: The sharing link for {url} no longer exists")
+            path = None
         else:
             raise e
     except Exception as e:
-        print(f"Error downloading file from URL {url}: {str(e)}")
+        print(f"  Error downloading file from URL {url}: {str(e)}")
         exit(1)
+    
+    return path
 
 
 async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat, msg: ChatMessage, chat_dir: str):
     # fetch all the "hosted contents" (inline attachments)
     if not msg.attachments:
         return
+    
+    # Mapping from attachment ID to filepath, for attachments that are downloaded
+    # This is necessary since otherwise when rendering we can't tell which
+    # attachments are downloaded and which are just references to URLs.
+    # A value of None means the download was attempted but unsuccessful.
+    attachments_map: dict[str, str | None] = {}
      
     for attachment in msg.attachments:
         if attachment.content_type == "application/vnd.microsoft.card.codesnippet":
@@ -208,13 +216,17 @@ async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat,
             await download_hosted_content(
                 client, chat, msg, hosted_content_id, chat_dir
             )
-        elif attachment.content_type == "reference" and attachment.content_url:
+        elif attachment.content_type == "reference" and attachment.id and attachment.content_url:
             # Download referenced attachments by URL too, as i hate SharePoint
             url = attachment.content_url
             matches = re.findall(r"https://([a-z0-9-]+)\.sharepoint\.com", url)
             if matches:
-                await download_sharepoint_document(client, url, chat_dir)
-                attachment.additional_data = {"locally_downloaded": True}
+                local_path = await download_sharepoint_document(client, url, chat_dir)
+                attachments_map[attachment.id] = local_path
+    
+    # Save the attachment map to the message file
+    with open(os.path.join(chat_dir, "attachments_map.json"), "w") as f:
+        f.write(json.dumps(attachments_map))
 
     # images are not present as attachments, just referenced in img tags
     content_type = msg.body.content_type if msg.body and msg.body.content_type else ""
@@ -241,7 +253,7 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
     if chat.id is None:
         return
 
-    async def save_msg(msg: ChatMessage):
+    async def save_msg(msg: ChatMessage, path: str):
         await download_hosted_content_in_msg(client, chat, msg, chat_dir)
 
         kiota_factory = kiota_serialization_json.json_serialization_writer_factory.JsonSerializationWriterFactory()
@@ -271,7 +283,7 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
         async for msg in fetch_all_for_request(messages_request, request_config):
             path = os.path.join(chat_dir, sanitize_filename(f"msg_{msg.id}.json"))
             if not os.path.exists(path):
-                await save_msg(msg)
+                await save_msg(msg, path)
                 count_saved += 1
             else:
                 # if incoming msg was deleted, we don't want to overwrite our file
@@ -286,7 +298,7 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
                         or existing_msg["lastEditedDateTime"]
                         != msg.last_edited_date_time
                     ):
-                        await save_msg(msg)
+                        await save_msg(msg, path)
                         count_updated += 1
                     else:
                         count_unchanged += 1
@@ -361,6 +373,13 @@ def render_hosted_content(msg: ChatMessage, hosted_content_id: str, chat_dir: st
 def render_message_body(msg: ChatMessage, chat_dir: str, html_dir: str) -> Optional[str]:
     """render a single message body, including its attachments"""
 
+    attachments_map: dict[str, str | None] = {}
+    try:
+        with open(os.path.join(chat_dir, "attachments_map.json"), "r") as f:
+            attachments_map = json.loads(f.read())
+    except FileNotFoundError:
+        pass
+
     def get_attachment(match: re.Match[str]):
         if not msg.attachments:
             print("  Error: attachment HTML but no attachments in msg object")
@@ -368,18 +387,12 @@ def render_message_body(msg: ChatMessage, chat_dir: str, html_dir: str) -> Optio
 
         attachment_id = match.group(1)
         attachment = [a for a in msg.attachments if a.id == attachment_id][0]
-        if attachment.content_type == "reference" and attachment.additional_data and attachment.additional_data.get("locally_downloaded"):
-            match = re.match(
-                r"https://[a-z0-9-]+\.sharepoint\.com/personal/([^/]+)/Documents/(.+)", url
-            )
-            if not match:
-                print(f"Error: URL does not match expected format: {url}")
-                return
+        if attachment.content_type == "reference" and attachment.id:
+            if attachments_map.get(attachment.id):
+                return f"<div class='attachment' data-attachment-id='{attachment.id}'><a href='{attachments_map.get(attachment.id)}'>{attachment.name}</a></div>"
+            else:
+                return f"<div class='attachment' data-attachment-id='{attachment.id}'><a href='{attachment.content_url}'>{attachment.name}</a> (not locally available)</div>"
 
-            user, file_path = match.groups()
-            local_filepath = urllib.parse.unquote(file_path)
-            local_filepath = os.path.join("data", chat_dir, user, local_filepath)
-            return f"<div class='attachment' data-attachment-id='{attachment.id}'><a href='{local_filepath}'>{attachment.name}</a></div>"
         elif attachment.content_type == "reference":
             return f"Attachment: <a href='{attachment.content_url}' data-attachment-id='{attachment.id}'>{attachment.name}</a><br/>"
         elif attachment.content_type == "messageReference" and attachment.content:
@@ -431,16 +444,16 @@ def render_chat(chat: Chat, output_dir: str):
     render a single chat to an html file. returns the name of the file rendered.
     """
 
-    # read all the msgs for the chat, order them in chron order
+    assert chat.id is not None
 
     html_dir = os.path.join(output_dir, "html")
     chat_dir = os.path.join(output_dir, "data", sanitize_filename(chat.id) or "unknown_id")
-
+    
+    # read all the msgs for the chat, order them in chron order
     messages_files = sorted(glob.glob(os.path.join(chat_dir, f"msg_*.json")))
     msgs: list[dict[str, ChatMessage | str | None]] = []
     for path in messages_files:
         with open(path, "rb") as f:
-            
             kiota_factory = kiota_serialization_json.json_parse_node_factory.JsonParseNodeFactory()
             kiota_parsenode = kiota_factory.get_root_parse_node(kiota_factory.get_valid_content_type(), f.read())
             msg = kiota_parsenode.get_object_value(ChatMessage.create_from_discriminator_value(kiota_parsenode))
