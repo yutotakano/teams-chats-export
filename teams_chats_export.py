@@ -26,6 +26,7 @@ from msgraph.generated.models.chat_message_attachment import ChatMessageAttachme
 from msgraph.generated.users.item.chats.chats_request_builder import ChatsRequestBuilder
 from msgraph.generated.users.item.chats.item.messages.messages_request_builder import MessagesRequestBuilder
 import pytz
+import datetime
 
 client_id = os.getenv("CLIENT_ID")
 
@@ -45,12 +46,11 @@ def get_jinja_env():
     return jinja_env
 
 
-def localdt(value: str, format: str ="%m/%d/%Y %I:%M %p %Z"):
+def localdt(dt: datetime.datetime | None, format: str ="%m/%d/%Y %I:%M %p %Z"):
     """parse a date string into a datetime object, localize it, and format it for display"""
-    tz = pytz.timezone("America/Los_Angeles")
-    dt = dateparser.parse(value)
     if dt is None:
         return ""
+    tz = pytz.timezone("Europe/London")
     local_dt = dt.astimezone(tz)
     return local_dt.strftime(format)
 
