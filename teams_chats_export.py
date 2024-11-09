@@ -103,11 +103,11 @@ def get_hosted_content_id(attachment: ChatMessageAttachment) -> str:
     return hosted_content_id
 
 @overload
-async def fetch_all_for_request(getable: ChatsRequestBuilder, request_config: ChatsRequestBuilder.ChatsRequestBuilderGetRequestConfiguration) -> Generator[Chat, Any, None]:
+async def fetch_all_for_request(getable: ChatsRequestBuilder, request_config: ChatsRequestBuilder.ChatsRequestBuilderGetRequestConfiguration) -> Generator[tuple[Chat, int], Any, None]:
     ...
 
 @overload
-async def fetch_all_for_request(getable: MessagesRequestBuilder, request_config: MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration) -> Generator[ChatMessage, Any, None]:
+async def fetch_all_for_request(getable: MessagesRequestBuilder, request_config: MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration) -> Generator[tuple[ChatMessage, int], Any, None]:
     ...
 
 async def fetch_all_for_request(getable: ChatsRequestBuilder | MessagesRequestBuilder, request_config: ChatsRequestBuilder.ChatsRequestBuilderGetRequestConfiguration | MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration):
@@ -129,8 +129,11 @@ async def fetch_all_for_request(getable: ChatsRequestBuilder | MessagesRequestBu
         if not response.value:
             print("  Error: no response.value")
             break
-        for result in response.value:
-            yield result
+        for i, result in enumerate(response.value):
+            # Return remaining count of items in the response, which is given
+            # in the generator output since it may dynamically change as we get
+            # more pages
+            yield (result, len(response.value) - i - 1) 
 
 
 async def download_hosted_content(
@@ -280,7 +283,12 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
             )
         )
 
-        async for msg in fetch_all_for_request(messages_request, request_config):
+        print(f"  Message 0/0", end="\r")
+        i = 0
+        async for msg, remaining in fetch_all_for_request(messages_request, request_config):
+            i += 1
+            print(f"  Message {i}/{i + remaining}", end="\r")
+
             path = os.path.join(chat_dir, sanitize_filename(f"msg_{msg.id}.json"))
             if not os.path.exists(path):
                 await save_msg(msg, path)
@@ -356,7 +364,10 @@ async def download_all(output_dir: str, force: bool):
     request_config = ChatsRequestBuilder.ChatsRequestBuilderGetRequestConfiguration(
         query_parameters=query_params,
     )
-    async for chat in fetch_all_for_request(client.me.chats, request_config):
+    i = 0
+    async for chat, remaining in fetch_all_for_request(client.me.chats, request_config):
+        i += 1
+        print(f"Downloading chat {i}/{i + remaining}")
         await download_chat(client, chat, data_dir, force)
 
 
