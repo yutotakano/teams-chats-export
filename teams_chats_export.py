@@ -7,7 +7,7 @@ import json
 import os
 import pprint
 import re
-import shutil
+import urllib
 import sys
 from typing import Any, Dict, Generator, Optional, overload
 
@@ -25,6 +25,7 @@ from msgraph.generated.models.chat_message import ChatMessage
 from msgraph.generated.models.chat_message_attachment import ChatMessageAttachment
 from msgraph.generated.users.item.chats.chats_request_builder import ChatsRequestBuilder
 from msgraph.generated.users.item.chats.item.messages.messages_request_builder import MessagesRequestBuilder
+from kiota_abstractions.api_error import APIError
 import pytz
 import datetime
 
@@ -64,11 +65,20 @@ def get_member_list(chat: Chat):
     ]
     return ", ".join(sorted(members))
 
+def sanitize_filename(filename: str, allow_unicode: bool = True) -> str:
+    """sanitize a filename to be suitable for Windows and Unix filesystems.
+    this function is idempotent.
+    it will remove e.g. slashes and colons but spaces, dots etc are allowed."""
+    pattern = r"[^-\w.,()]"
+    if allow_unicode:
+        pattern = r"(?u)" + pattern
+    return re.sub(pattern, "", filename.strip())
+
 
 def get_chat_name(chat: Chat):
     """get a "name" for the chat: either its topic or a comma-separated list of members"""
     if chat.topic:
-        name = chat.topic.replace(os.path.sep, "_")
+        name = chat.topic
     else:
         name = get_member_list(chat)
     return name
@@ -80,7 +90,7 @@ def get_hosted_content_filename(msg_id: str, hosted_content_id: str):
     truncating if necessary to keep it under the filename size limit
     """
     filename = f"hosted_content_{msg_id}_{hosted_content_id}"
-    return filename[0:filename_size_limit]
+    return sanitize_filename(filename[0:filename_size_limit])
 
 
 def get_hosted_content_id(attachment: ChatMessageAttachment) -> str:
@@ -163,6 +173,7 @@ async def download_sharepoint_document(client: GraphServiceClient, url: str, cha
         return
 
     user, file_path = match.groups()
+    file_path = urllib.parse.unquote(file_path)
 
     try:
         # Download the file content
@@ -174,7 +185,13 @@ async def download_sharepoint_document(client: GraphServiceClient, url: str, cha
         makedir(os.path.dirname(path))
         with open(path, "wb") as f:
             f.write(content_bytes)
-        print(f"Downloaded file to {path}")
+    except APIError as e:
+        # If the sharing link no longer exists, just warn and continue, can't do
+        # anything about it
+        if "error" in e and "The sharing link no longer exists" in e.error.message:
+            print(f"Warn: The sharing link for {url} no longer exists")
+        else:
+            raise e
     except Exception as e:
         print(f"Error downloading file from URL {url}: {str(e)}")
         exit(1)
@@ -233,7 +250,7 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
         await download_hosted_content_in_msg(client, chat, msg, chat_dir)
 
     last_msg_id = chat.last_message_preview.id if chat.last_message_preview is not None else None
-    last_msg_exists = os.path.exists(os.path.join(chat_dir, f"msg_{last_msg_id}.json"))
+    last_msg_exists = os.path.exists(os.path.join(chat_dir, sanitize_filename(f"msg_{last_msg_id}.json")))
     if force or not last_msg_id or not last_msg_exists:
         count_saved = 0
         count_updated = 0
@@ -250,7 +267,7 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
         )
 
         async for msg in fetch_all_for_request(messages_request, request_config):
-            path = os.path.join(chat_dir, f"msg_{msg.id}.json")
+            path = os.path.join(chat_dir, sanitize_filename(f"msg_{msg.id}.json"))
             if not os.path.exists(path):
                 await save_msg(msg)
                 count_saved += 1
@@ -294,14 +311,14 @@ async def download_chat(client: GraphServiceClient, chat: Chat, data_dir: str, f
         print("  Skipping chat with no id")
         return
 
-    chat_dir = os.path.join(data_dir, chat.id)
+    chat_dir = os.path.join(data_dir, sanitize_filename(chat.id))
     makedir(chat_dir)
 
     kiota_factory = kiota_serialization_json.json_serialization_writer_factory.JsonSerializationWriterFactory()
     kiota_writer = kiota_factory.get_serialization_writer(kiota_factory.get_valid_content_type())
     chat.serialize(kiota_writer)
 
-    with open(os.path.join(data_dir, f"{chat.id}.json"), "wb") as f:
+    with open(f"{chat_dir}.json", "wb") as f:
         f.write(kiota_writer.get_serialized_content())
 
     await download_messages(client, chat, chat_dir, force)
@@ -400,7 +417,7 @@ def render_chat(chat: Chat, output_dir: str):
     # read all the msgs for the chat, order them in chron order
 
     html_dir = os.path.join(output_dir, "html")
-    chat_dir = os.path.join(output_dir, "data", chat.id or "unknown_id")
+    chat_dir = os.path.join(output_dir, "data", sanitize_filename(chat.id) or "unknown_id")
 
     messages_files = sorted(glob.glob(os.path.join(chat_dir, f"msg_*.json")))
     msgs: list[dict[str, ChatMessage | str | None]] = []
@@ -417,7 +434,7 @@ def render_chat(chat: Chat, output_dir: str):
 
     # write out the html file
 
-    filename = f"{chat.id}.html"
+    filename = sanitize_filename(f"{chat.id}.html")
 
     path = os.path.join(html_dir, filename)
 
