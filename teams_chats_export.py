@@ -7,24 +7,21 @@ import json
 import os
 import pprint
 import re
-import urllib
+import urllib.parse
 import sys
-from typing import Any, Dict, Generator, Optional, overload
+from typing import Any, Generator, Optional, overload
 
 from azure.identity import InteractiveBrowserCredential
-import dateparser
 from jinja2 import Environment, FileSystemLoader
-from kiota_abstractions.native_response_handler import NativeResponseHandler
-from kiota_http.middleware.options import ResponseHandlerOption
-import kiota_serialization_json 
+import kiota_serialization_json
 import kiota_serialization_json.json_parse_node_factory
 import kiota_serialization_json.json_serialization_writer_factory
-from msgraph import GraphServiceClient
-from msgraph.generated.models.chat import Chat
-from msgraph.generated.models.chat_message import ChatMessage
-from msgraph.generated.models.chat_message_attachment import ChatMessageAttachment
-from msgraph.generated.users.item.chats.chats_request_builder import ChatsRequestBuilder
-from msgraph.generated.users.item.chats.item.messages.messages_request_builder import MessagesRequestBuilder
+from msgraph.graph_service_client import GraphServiceClient
+from msgraph.generated.models.chat import Chat # type: ignore
+from msgraph.generated.models.chat_message import ChatMessage # type: ignore
+from msgraph.generated.models.chat_message_attachment import ChatMessageAttachment # type: ignore
+from msgraph.generated.users.item.chats.chats_request_builder import ChatsRequestBuilder # type: ignore
+from msgraph.generated.users.item.chats.item.messages.messages_request_builder import MessagesRequestBuilder # type: ignore
 from kiota_abstractions.api_error import APIError
 import pytz
 import datetime
@@ -133,7 +130,7 @@ async def fetch_all_for_request(getable: ChatsRequestBuilder | MessagesRequestBu
             # Return remaining count of items in the response, which is given
             # in the generator output since it may dynamically change as we get
             # more pages
-            yield (result, len(response.value) - i - 1) 
+            yield (result, len(response.value) - i - 1)
 
 
 async def download_hosted_content(
@@ -158,6 +155,11 @@ async def download_hosted_content(
         result = str(e).encode()
     filename = get_hosted_content_filename(msg.id, hosted_content_id)
     path = os.path.join(chat_dir, filename)
+
+    if result is None:
+        print("  Error: no result")
+        return
+
     with open(path, "wb") as f:
         f.write(result)
 
@@ -171,7 +173,7 @@ async def download_sharepoint_document(client: GraphServiceClient, url: str, cha
         r"https://[a-z0-9-]+\.sharepoint\.com/personal/([^/]+)/Documents/(.+)", url
     )
     if not match:
-        print(f"Error: URL does not match expected format: {url}")
+        print(f"  Error: URL does not match expected format: {url}")
         return
 
     user, file_path = match.groups()
@@ -182,6 +184,8 @@ async def download_sharepoint_document(client: GraphServiceClient, url: str, cha
         b64url = base64.b64encode(url.encode()).decode()
         b64url = "u!" + b64url.replace("/", "_").replace("+", "-").replace("=", "")
         content_bytes = await client.shares.by_shared_drive_item_id(b64url).drive_item.content.get()
+        if not content_bytes:
+            raise Exception(f"No content returned for {url}")
         # Save the file
         path = os.path.join(chat_dir, user, file_path)
         makedir(os.path.dirname(path))
@@ -198,7 +202,7 @@ async def download_sharepoint_document(client: GraphServiceClient, url: str, cha
     except Exception as e:
         print(f"  Error downloading file from URL {url}: {str(e)}")
         exit(1)
-    
+
     return path
 
 
@@ -206,13 +210,13 @@ async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat,
     # fetch all the "hosted contents" (inline attachments)
     if not msg.attachments:
         return
-    
+
     # Mapping from attachment ID to filepath, for attachments that are downloaded
     # This is necessary since otherwise when rendering we can't tell which
     # attachments are downloaded and which are just references to URLs.
     # A value of None means the download was attempted but unsuccessful.
     attachments_map: dict[str, str | None] = {}
-     
+
     for attachment in msg.attachments:
         if attachment.content_type == "application/vnd.microsoft.card.codesnippet":
             hosted_content_id = get_hosted_content_id(attachment)
@@ -226,7 +230,7 @@ async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat,
             if matches:
                 local_path = await download_sharepoint_document(client, url, chat_dir)
                 attachments_map[attachment.id] = local_path
-    
+
     # Save the attachment map to the message file
     with open(os.path.join(chat_dir, "attachments_map.json"), "w") as f:
         f.write(json.dumps(attachments_map))
@@ -373,7 +377,7 @@ async def download_all(output_dir: str, force: bool):
 
 def render_hosted_content(msg: ChatMessage, hosted_content_id: str, chat_dir: str):
     if not msg.id:
-        return "Error: no msg id" 
+        return "Error: no msg id"
     filename = get_hosted_content_filename(msg.id, hosted_content_id)
     path = os.path.join(chat_dir, filename)
     with open(path, "r") as f:
@@ -459,7 +463,7 @@ def render_chat(chat: Chat, output_dir: str):
 
     html_dir = os.path.join(output_dir, "html")
     chat_dir = os.path.join(output_dir, "data", sanitize_filename(chat.id) or "unknown_id")
-    
+
     # read all the msgs for the chat, order them in chron order
     messages_files = sorted(glob.glob(os.path.join(chat_dir, f"msg_*.json")))
     msgs: list[dict[str, ChatMessage | str | None]] = []
@@ -468,7 +472,7 @@ def render_chat(chat: Chat, output_dir: str):
             kiota_factory = kiota_serialization_json.json_parse_node_factory.JsonParseNodeFactory()
             kiota_parsenode = kiota_factory.get_root_parse_node(kiota_factory.get_valid_content_type(), f.read())
             msg = kiota_parsenode.get_object_value(ChatMessage.create_from_discriminator_value(kiota_parsenode))
-            
+
             msgs.append(
                 {"obj": msg, "content": render_message_body(msg, chat_dir, html_dir)}
             )
