@@ -150,6 +150,36 @@ async def download_hosted_content(
         f.write(result)
 
 
+async def download_file_from_url(client: GraphServiceClient, url: str, chat_dir: str):
+    """
+    Download a file from a SharePoint URL using the Graph API.
+    """
+    # Extract the site name and path from the URL
+    match = re.match(
+        r"https://([a-z0-9-]+)\.sharepoint\.com/personal/([^/]+)/Documents/(.+)", url
+    )
+    if not match:
+        print(f"Error: URL does not match expected format: {url}")
+        return
+
+    site_name, user, file_path = match.groups()
+
+    try:
+        # Download the file content
+        b64url = base64.b64encode(url.encode()).decode()
+        b64url = "u!" + b64url.replace("/", "_").replace("+", "-").replace("=", "")
+        content_bytes = await client.shares.by_shared_drive_item_id(b64url).drive_item.content.get()
+        # Save the file
+        filename = os.path.basename(file_path)
+        path = os.path.join(chat_dir, filename)
+        with open(path, "wb") as f:
+            f.write(content_bytes)
+        print(f"Downloaded file to {path}")
+    except Exception as e:
+        print(f"Error downloading file from URL {url}: {str(e)}")
+        exit(1)
+
+
 async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat, msg: ChatMessage, chat_dir: str):
     # fetch all the "hosted contents" (inline attachments)
     if not msg.attachments:
@@ -161,6 +191,12 @@ async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat,
             await download_hosted_content(
                 client, chat, msg, hosted_content_id, chat_dir
             )
+        elif attachment.content_type == "reference" and attachment.content_url:
+            # Download referenced attachments by URL too, as i hate SharePoint
+            url = attachment.content_url
+            matches = re.findall(r"https://([a-z0-9-]+)\.sharepoint\.com", url)
+            if matches:
+                await download_file_from_url(client, url, chat_dir)
 
     # images are not present as attachments, just referenced in img tags
     content_type = msg.body.content_type if msg.body and msg.body.content_type else ""
@@ -438,7 +474,7 @@ def get_graph_client() -> GraphServiceClient:
         sys.exit(1)
 
     credential = InteractiveBrowserCredential(client_id=client_id)
-    scopes = ["Chat.Read"]
+    scopes = ["Chat.Read", "Sites.Read.All", "Files.Read.All"]
     client = GraphServiceClient(credentials=credential, scopes=scopes)
     return client
 
