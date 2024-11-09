@@ -214,6 +214,7 @@ async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat,
             matches = re.findall(r"https://([a-z0-9-]+)\.sharepoint\.com", url)
             if matches:
                 await download_sharepoint_document(client, url, chat_dir)
+                attachment.additional_data = {"locally_downloaded": True}
 
     # images are not present as attachments, just referenced in img tags
     content_type = msg.body.content_type if msg.body and msg.body.content_type else ""
@@ -363,7 +364,19 @@ def render_message_body(msg: ChatMessage, chat_dir: str, html_dir: str) -> Optio
 
         attachment_id = match.group(1)
         attachment = [a for a in msg.attachments if a.id == attachment_id][0]
-        if attachment.content_type == "reference":
+        if attachment.content_type == "reference" and attachment.additional_data and attachment.additional_data.get("locally_downloaded"):
+            match = re.match(
+                r"https://[a-z0-9-]+\.sharepoint\.com/personal/([^/]+)/Documents/(.+)", url
+            )
+            if not match:
+                print(f"Error: URL does not match expected format: {url}")
+                return
+
+            user, file_path = match.groups()
+            local_filepath = urllib.parse.unquote(file_path)
+            local_filepath = os.path.join("data", chat_dir, user, local_filepath)
+            return f"<div class='attachment' data-attachment-id='{attachment.id}'><a href='{local_filepath}'>{attachment.name}</a></div>"
+        elif attachment.content_type == "reference":
             return f"Attachment: <a href='{attachment.content_url}' data-attachment-id='{attachment.id}'>{attachment.name}</a><br/>"
         elif attachment.content_type == "messageReference" and attachment.content:
             ref = json.loads(attachment.content)
