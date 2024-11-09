@@ -9,16 +9,22 @@ import pprint
 import re
 import shutil
 import sys
-from typing import Dict, Optional
+from typing import Any, Dict, Generator, Optional, overload
 
 from azure.identity import InteractiveBrowserCredential
 import dateparser
 from jinja2 import Environment, FileSystemLoader
 from kiota_abstractions.native_response_handler import NativeResponseHandler
 from kiota_http.middleware.options import ResponseHandlerOption
+import kiota_serialization_json 
+import kiota_serialization_json.json_parse_node_factory
+import kiota_serialization_json.json_serialization_writer_factory
 from msgraph import GraphServiceClient
-from msgraph.generated.chats.chats_request_builder import ChatsRequestBuilder
-from msgraph.generated.chats.item.messages.messages_request_builder import MessagesRequestBuilder
+from msgraph.generated.models.chat import Chat
+from msgraph.generated.models.chat_message import ChatMessage
+from msgraph.generated.models.chat_message_attachment import ChatMessageAttachment
+from msgraph.generated.users.item.chats.chats_request_builder import ChatsRequestBuilder
+from msgraph.generated.users.item.chats.item.messages.messages_request_builder import MessagesRequestBuilder
 import pytz
 
 client_id = os.getenv("CLIENT_ID")
@@ -26,7 +32,7 @@ client_id = os.getenv("CLIENT_ID")
 filename_size_limit = 255
 
 
-def makedir(path):
+def makedir(path: str):
     """basically mkdir -p"""
     if not os.path.exists(path):
         os.makedirs(os.path.join(path), exist_ok=True)
@@ -35,36 +41,40 @@ def makedir(path):
 @cache
 def get_jinja_env():
     jinja_env = Environment(loader=FileSystemLoader("templates"))
-    jinja_env.filters["localdt"] = localdt
+    jinja_env.filters["localdt"] = localdt # type: ignore
     return jinja_env
 
 
-def localdt(value: str, format="%m/%d/%Y %I:%M %p %Z"):
+def localdt(value: str, format: str ="%m/%d/%Y %I:%M %p %Z"):
     """parse a date string into a datetime object, localize it, and format it for display"""
     tz = pytz.timezone("America/Los_Angeles")
     dt = dateparser.parse(value)
+    if dt is None:
+        return ""
     local_dt = dt.astimezone(tz)
     return local_dt.strftime(format)
 
 
-def get_member_list(chat: dict):
+def get_member_list(chat: Chat):
     """return a sorted comma-separated list of chat members"""
+    if chat.members is None:
+        return "No Members"
     members = [
-        m["displayName"] if m["displayName"] else "No Name" for m in chat["members"]
+        m.display_name if m.display_name else "No Name" for m in chat.members
     ]
     return ", ".join(sorted(members))
 
 
-def get_chat_name(chat: dict):
+def get_chat_name(chat: Chat):
     """get a "name" for the chat: either its topic or a comma-separated list of members"""
-    if chat["topic"]:
-        name = chat["topic"].replace(os.path.sep, "_")
+    if chat.topic:
+        name = chat.topic.replace(os.path.sep, "_")
     else:
         name = get_member_list(chat)
     return name
 
 
-def get_hosted_content_filename(msg_id, hosted_content_id):
+def get_hosted_content_filename(msg_id: str, hosted_content_id: str):
     """
     return a base filename for the msg_id + hosted_content_id,
     truncating if necessary to keep it under the filename size limit
@@ -73,16 +83,25 @@ def get_hosted_content_filename(msg_id, hosted_content_id):
     return filename[0:filename_size_limit]
 
 
-def get_hosted_content_id(attachment: dict) -> str:
+def get_hosted_content_id(attachment: ChatMessageAttachment) -> str:
     """extract the hosted_content_id from the Attachment dict record"""
     # it's stupid that I have to parse this. codeSnippetUrl already is the complete URL
     # but I can't figure out how to make a request to it directly using the client object
-    content = json.loads(attachment["content"])
+    if not attachment.content:
+        return ""
+    content = json.loads(attachment.content)
     hosted_content_id = content["codeSnippetUrl"].split("/")[-2]
     return hosted_content_id
 
+@overload
+async def fetch_all_for_request(getable: ChatsRequestBuilder, request_config: ChatsRequestBuilder.ChatsRequestBuilderGetRequestConfiguration) -> Generator[Chat, Any, None]:
+    ...
 
-async def fetch_all_for_request(getable, request_config):
+@overload
+async def fetch_all_for_request(getable: MessagesRequestBuilder, request_config: MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration) -> Generator[ChatMessage, Any, None]:
+    ...
+
+async def fetch_all_for_request(getable: ChatsRequestBuilder | MessagesRequestBuilder, request_config: ChatsRequestBuilder.ChatsRequestBuilderGetRequestConfiguration | MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration):
     """
     returns an iterator over the dict records returned from a request
 
@@ -98,51 +117,64 @@ async def fetch_all_for_request(getable, request_config):
             else:
                 getable_ = None
         if getable_:
-            response = await getable_.get(request_configuration=request_config)
-            if response:
-                results = response.json()
-                for result in results["value"]:
+            response = await getable_.get(request_configuration=request_config) # type: ignore
+            if response and response.value:
+                for result in response.value:
                     yield result
 
 
-async def download_hosted_content(client, chat: Dict, msg: Dict, hosted_content_id: str, chat_dir: str):
+async def download_hosted_content(
+    client: GraphServiceClient, chat: Chat, msg: ChatMessage, hosted_content_id: str, chat_dir: str
+):
+    if not chat.id or not msg.id:
+        print("  Error: chat or msg id is None")
+        return
+
     # it's happened in one case that a user doesn't have access to the hosted content
     # in a chat they're a member of. not sure how that's possible, but that's why
     # this check is here.
     try:
         result = (
-            await client.chats.by_chat_id(chat["id"])
-            .messages.by_chat_message_id(msg["id"])
+            await client.chats.by_chat_id(chat.id)
+            .messages.by_chat_message_id(msg.id)
             .hosted_contents.by_chat_message_hosted_content_id(hosted_content_id)
             .content.get()
         )
     except Exception as e:
-        result = str(e)
-    filename = get_hosted_content_filename(msg['id'], hosted_content_id)
+        print("  Error: " + str(e))
+        result = str(e).encode()
+    filename = get_hosted_content_filename(msg.id, hosted_content_id)
     path = os.path.join(chat_dir, filename)
     with open(path, "wb") as f:
         f.write(result)
 
 
-async def download_hosted_content_in_msg(client, chat: Dict, msg: Dict, chat_dir: str):
+async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat, msg: ChatMessage, chat_dir: str):
     # fetch all the "hosted contents" (inline attachments)
-    for attachment in msg["attachments"]:
-        if attachment["contentType"] == "application/vnd.microsoft.card.codesnippet":
+    if not msg.attachments:
+        return
+     
+    for attachment in msg.attachments:
+        if attachment.content_type == "application/vnd.microsoft.card.codesnippet":
             hosted_content_id = get_hosted_content_id(attachment)
-            await download_hosted_content(client, chat, msg, hosted_content_id, chat_dir)
+            await download_hosted_content(
+                client, chat, msg, hosted_content_id, chat_dir
+            )
 
     # images are not present as attachments, just referenced in img tags
-    content_type = (msg.get("body") or {}).get("contentType", "")
-    content = (msg.get("body") or {}).get("content", "")
+    content_type = msg.body.content_type if msg.body and msg.body.content_type else ""
+    content = msg.body.content if msg.body and msg.body.content else ""
     if content_type == "html":
         for match in re.findall('src="(.+?)"', content):
             url = match
             if "https://graph.microsoft.com/v1.0/chats/" in url:
                 hosted_content_id = url.split("/")[-2]
-                await download_hosted_content(client, chat, msg, hosted_content_id, chat_dir)
+                await download_hosted_content(
+                    client, chat, msg, hosted_content_id, chat_dir
+                )
 
 
-async def download_messages(client, chat: Dict, chat_dir: str, force: bool = False):
+async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: str, force: bool = False):
     """
     download messages for a chat, including its 'hosted content'
 
@@ -151,43 +183,52 @@ async def download_messages(client, chat: Dict, chat_dir: str, force: bool = Fal
     the 'force' flag downloads all messages that haven't been saved yet.
     by default, only newer messages are downloaded.
     """
+    if chat.id is None:
+        return
 
-    async def save_msg(msg):
-        with open(path, "w") as f:
-            f.write(json.dumps(msg))
+    async def save_msg(msg: ChatMessage):
+        kiota_factory = kiota_serialization_json.json_serialization_writer_factory.JsonSerializationWriterFactory()
+        kiota_writer = kiota_factory.get_serialization_writer(kiota_factory.get_valid_content_type())
+        msg.serialize(kiota_writer)
+
+        with open(path, "wb") as f:
+            f.write(kiota_writer.get_serialized_content())
         await download_hosted_content_in_msg(client, chat, msg, chat_dir)
 
-    last_msg_id = (chat["lastMessagePreview"] or {}).get("id")
+    last_msg_id = chat.last_message_preview.id if chat.last_message_preview is not None else None
     last_msg_exists = os.path.exists(os.path.join(chat_dir, f"msg_{last_msg_id}.json"))
     if force or not last_msg_id or not last_msg_exists:
         count_saved = 0
         count_updated = 0
         count_unchanged = 0
-        messages_request = client.me.chats.by_chat_id(chat["id"]).messages
+        messages_request = client.me.chats.by_chat_id(chat.id).messages
 
         query_params = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
             top=50,
         )
-        request_config = MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration(
-            options=[ResponseHandlerOption(NativeResponseHandler())],
-            query_parameters=query_params,
+        request_config = (
+            MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration(
+                query_parameters=query_params,
+            )
         )
 
         async for msg in fetch_all_for_request(messages_request, request_config):
-            path = os.path.join(chat_dir, f"msg_{msg['id']}.json")
+            path = os.path.join(chat_dir, f"msg_{msg.id}.json")
             if not os.path.exists(path):
                 await save_msg(msg)
                 count_saved += 1
             else:
                 # if incoming msg was deleted, we don't want to overwrite our file
-                if not msg["deletedDateTime"]:
+                if not msg.deleted_date_time:
                     with open(path, "r") as f:
                         existing_msg = json.loads(f.read())
 
                     # save edited/modified msgs
                     if (
-                        existing_msg["lastModifiedDateTime"] != msg["lastModifiedDateTime"]
-                        or existing_msg["lastEditedDateTime"] != msg["lastEditedDateTime"]
+                        existing_msg["lastModifiedDateTime"]
+                        != msg.last_modified_date_time
+                        or existing_msg["lastEditedDateTime"]
+                        != msg.last_edited_date_time
                     ):
                         await save_msg(msg)
                         count_updated += 1
@@ -208,15 +249,23 @@ async def download_messages(client, chat: Dict, chat_dir: str, force: bool = Fal
         print("  No new messages in the chat since last run")
 
 
-async def download_chat(client, chat: Dict, data_dir: str, force: bool):
+async def download_chat(client: GraphServiceClient, chat: Chat, data_dir: str, force: bool):
     """download a single chat and its associated data (messages, attachments)"""
-    print(f"Processing chat {get_chat_name(chat)} (id {chat['id']})")
+    print(f"Processing chat {get_chat_name(chat)} (id {chat.id})")
 
-    chat_dir = os.path.join(data_dir, chat["id"])
+    if chat.id is None:
+        print("  Skipping chat with no id")
+        return
+
+    chat_dir = os.path.join(data_dir, chat.id)
     makedir(chat_dir)
 
-    with open(os.path.join(data_dir, f"{chat['id']}.json"), "w") as f:
-        f.write(json.dumps(chat))
+    kiota_factory = kiota_serialization_json.json_serialization_writer_factory.JsonSerializationWriterFactory()
+    kiota_writer = kiota_factory.get_serialization_writer(kiota_factory.get_valid_content_type())
+    chat.serialize(kiota_writer)
+
+    with open(os.path.join(data_dir, f"{chat.id}.json"), "wb") as f:
+        f.write(kiota_writer.get_serialized_content())
 
     await download_messages(client, chat, chat_dir, force)
 
@@ -234,70 +283,79 @@ async def download_all(output_dir: str, force: bool):
         expand=["members", "lastMessagePreview"], top=50
     )
     request_config = ChatsRequestBuilder.ChatsRequestBuilderGetRequestConfiguration(
-        options=[ResponseHandlerOption(NativeResponseHandler())],
         query_parameters=query_params,
     )
     async for chat in fetch_all_for_request(client.me.chats, request_config):
         await download_chat(client, chat, data_dir, force)
 
 
-def render_hosted_content(msg: Dict, hosted_content_id: str, chat_dir: str):
-    filename = get_hosted_content_filename(msg['id'], hosted_content_id)
+def render_hosted_content(msg: ChatMessage, hosted_content_id: str, chat_dir: str):
+    if not msg.id:
+        return "Error: no msg id" 
+    filename = get_hosted_content_filename(msg.id, hosted_content_id)
     path = os.path.join(chat_dir, filename)
     with open(path, "r") as f:
         data = f.read()
     return data
 
 
-def render_message_body(msg: Dict, chat_dir: str, html_dir: str) -> Optional[str]:
+def render_message_body(msg: ChatMessage, chat_dir: str, html_dir: str) -> Optional[str]:
     """render a single message body, including its attachments"""
 
-    def get_attachment(match):
+    def get_attachment(match: re.Match[str]):
+        if not msg.attachments:
+            print("  Error: attachment HTML but no attachments in msg object")
+            return "Attachment (no attachment data)<br/>"
+
         attachment_id = match.group(1)
-        attachment = [a for a in msg["attachments"] if a["id"] == attachment_id][0]
-        if attachment["contentType"] == "reference":
-            return f"Attachment: <a href='{attachment['contentUrl']}' data-attachment-id='{attachment['id']}'>{attachment['name']}</a><br/>"
-        elif attachment["contentType"] == "messageReference":
-            ref = json.loads(attachment["content"])
-            return f"<blockquote class='message-reference' data-attachment-id='{attachment['id']}'>{ref['messageSender']['user']['displayName']}: {ref['messagePreview']}</blockquote>"
-        elif attachment["contentType"] == "application/vnd.microsoft.card.codesnippet":
+        attachment = [a for a in msg.attachments if a.id == attachment_id][0]
+        if attachment.content_type == "reference":
+            return f"Attachment: <a href='{attachment.content_url}' data-attachment-id='{attachment.id}'>{attachment.name}</a><br/>"
+        elif attachment.content_type == "messageReference" and attachment.content:
+            ref = json.loads(attachment.content)
+            return f"<blockquote class='message-reference' data-attachment-id='{attachment.id}'>{ref['messageSender']['user']['displayName']}: {ref['messagePreview']}</blockquote>"
+        elif attachment.content_type == "application/vnd.microsoft.card.codesnippet":
             hosted_content_id = get_hosted_content_id(attachment)
             content = render_hosted_content(msg, hosted_content_id, chat_dir)
-            return f"<div class='hosted-content' data-attachment-id='{attachment['id']}' data-hosted-content-id='{hosted_content_id}'><pre><code>{content}</code></pre></div>"
+            return f"<div class='hosted-content' data-attachment-id='{attachment.id}' data-hosted-content-id='{hosted_content_id}'><pre><code>{content}</code></pre></div>"
         else:
             return f"Attachment (raw data): {pprint.pformat(attachment)}<br/>"
 
-    def get_image(match):
+    def get_image(match: re.Match[str]):
         whole_match = match.group(0)
         url = match.group(1)
-        if "https://graph.microsoft.com/v1.0/chats/" in url:
+        if "https://graph.microsoft.com/v1.0/chats/" in url and msg.id:
             hosted_content_id = url.split("/")[-2]
-            filename = get_hosted_content_filename(msg['id'], hosted_content_id)
+            filename = get_hosted_content_filename(msg.id, hosted_content_id)
             with open(os.path.join(chat_dir, filename), "rb") as f:
                 # TODO: not all images are actually png but this seems to work anyway
-                data = "data:image/png;base64," + base64.b64encode(f.read()).decode("utf-8")
-                return whole_match.replace(url, data) + f" data-hosted-content-id='{hosted_content_id}'"
+                data = "data:image/png;base64," + base64.b64encode(f.read()).decode(
+                    "utf-8"
+                )
+                return (
+                    whole_match.replace(url, data)
+                    + f" data-hosted-content-id='{hosted_content_id}'"
+                )
         else:
             return whole_match
 
-    if msg["body"] and msg["body"]["content"]:
-        v = msg["body"]["content"]
-        if v:
-            if v[0:3].lower() != "<p>":
-                v = f"<p>{v}</p>"
+    if msg.body and msg.body.content:
+        v = msg.body.content
+        if v[0:3].lower() != "<p>":
+            v = f"<p>{v}</p>"
 
-            v = re.sub('<emoji.+?alt="(.+?)".+?></emoji>', r"\g<1>", v)
+        v = re.sub('<emoji.+?alt="(.+?)".+?></emoji>', r"\g<1>", v)
 
-            v = re.sub('<attachment id="(.+?)"></attachment>', get_attachment, v)
+        v = re.sub('<attachment id="(.+?)"></attachment>', get_attachment, v)
 
-            # loosey-goosey matching here :(
-            v = re.sub('src="(.+?)"', get_image, v)
+        # loosey-goosey matching here :(
+        v = re.sub('src="(.+?)"', get_image, v)
         return v
 
     return None
 
 
-def render_chat(chat: Dict, output_dir: str):
+def render_chat(chat: Chat, output_dir: str):
     """
     render a single chat to an html file. returns the name of the file rendered.
     """
@@ -305,18 +363,24 @@ def render_chat(chat: Dict, output_dir: str):
     # read all the msgs for the chat, order them in chron order
 
     html_dir = os.path.join(output_dir, "html")
-    chat_dir = os.path.join(output_dir, "data", chat["id"])
+    chat_dir = os.path.join(output_dir, "data", chat.id or "unknown_id")
 
     messages_files = sorted(glob.glob(os.path.join(chat_dir, f"msg_*.json")))
-    msgs = []
+    msgs: list[dict[str, ChatMessage | str | None]] = []
     for path in messages_files:
-        with open(path, "r") as f:
-            msg = json.loads(f.read())
-            msgs.append({"obj": msg, "content": render_message_body(msg, chat_dir, html_dir)})
+        with open(path, "rb") as f:
+            
+            kiota_factory = kiota_serialization_json.json_parse_node_factory.JsonParseNodeFactory()
+            kiota_parsenode = kiota_factory.get_root_parse_node(kiota_factory.get_valid_content_type(), f.read())
+            msg = kiota_parsenode.get_object_value(ChatMessage.create_from_discriminator_value(kiota_parsenode))
+            
+            msgs.append(
+                {"obj": msg, "content": render_message_body(msg, chat_dir, html_dir)}
+            )
 
     # write out the html file
 
-    filename = f"{chat['id']}.html"
+    filename = f"{chat.id}.html"
 
     path = os.path.join(html_dir, filename)
 
@@ -333,25 +397,27 @@ def render_chat(chat: Dict, output_dir: str):
     return filename
 
 
-def render_all(output_dir):
+def render_all(output_dir: str):
     """render all the chats to html files"""
 
-    all_chats = []
+    all_chats: list[dict[str, str]] = []
 
     makedir(os.path.join(output_dir, "html"))
 
     chat_files = sorted(glob.glob(os.path.join(output_dir, "data", "*.json")))
     for path in chat_files:
-        with open(path, "r") as f:
-            chat = json.loads(f.read())
+        with open(path, "rb") as f:
+            kiota_factory = kiota_serialization_json.json_parse_node_factory.JsonParseNodeFactory()
+            kiota_parsenode = kiota_factory.get_root_parse_node(kiota_factory.get_valid_content_type(), f.read())
+            chat = kiota_parsenode.get_object_value(Chat.create_from_discriminator_value(kiota_parsenode))
 
             filename = render_chat(chat, output_dir)
 
             chat_name = get_chat_name(chat)
 
-            all_chats.append({ "filename": filename, "chat_name": chat_name })
+            all_chats.append({"filename": filename, "chat_name": chat_name})
 
-    all_chats = sorted(all_chats, key=lambda d: d['chat_name'])
+    all_chats = sorted(all_chats, key=lambda d: d["chat_name"])
 
     index_file = os.path.join(output_dir, "html", "index.html")
 
@@ -380,7 +446,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["download", "generate_html"])
     parser.add_argument("--output-dir", type=str, default="archive")
-    parser.add_argument("--force", help="download all msgs, not just 'newest' ones", action="store_true")
+    parser.add_argument(
+        "--force", help="download all msgs, not just 'newest' ones", action="store_true"
+    )
     args = parser.parse_args()
 
     if args.command == "download":
