@@ -108,19 +108,20 @@ async def fetch_all_for_request(getable: ChatsRequestBuilder | MessagesRequestBu
     getable = an MS Graph API object with a get() method.
     request_config = request configuration object to pass to get()
     """
-    results = None
-    getable_ = getable
-    while getable_:
-        if results:
-            if "@odata.nextLink" in results:
-                getable_ = getable.with_url(results["@odata.nextLink"])
-            else:
-                getable_ = None
-        if getable_:
-            response = await getable_.get(request_configuration=request_config) # type: ignore
-            if response and response.value:
-                for result in response.value:
-                    yield result
+    target_request = getable
+    while target_request:
+        response = await target_request.get(request_configuration=request_config) # type: ignore
+        if not response:
+            print("  Error: no response")
+            break
+
+        target_request = getable.with_url(response.odata_next_link) if response.odata_next_link else None
+
+        if not response.value:
+            print("  Error: no response.value")
+            break
+        for result in response.value:
+            yield result
 
 
 async def download_hosted_content(
