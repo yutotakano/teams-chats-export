@@ -293,7 +293,10 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
     # good enough for now.
     last_msg_id = chat.last_message_preview.id if chat.last_message_preview is not None else None
     last_msg_exists = os.path.exists(os.path.join(chat_dir, sanitize_filename(f"msg_{last_msg_id}.json")))
-    if force or not last_msg_id or not last_msg_exists:
+
+    max_retries = 5
+    retries = 0
+    while (force or not last_msg_exists) and retries < max_retries:
         if not last_msg_id:
             print("  Could not determine last message ID, checking all messages")
         elif not last_msg_exists:
@@ -305,9 +308,14 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
         count_unchanged = 0
         messages_request = client.me.chats.by_chat_id(chat.id).messages
 
+        config = RequestConfiguration(
+            query_parameters=MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
+                top=50
+            )
+        )
         print(f"  Message 0/0", end="\r")
         i = 0
-        async for msg, remaining in fetch_all_for_request(messages_request, None):
+        async for msg, remaining in fetch_all_for_request(messages_request, config):
             i += 1
             print(f"  Message {i}/{i + remaining}", end="\r")
 
@@ -343,6 +351,18 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
         if not force:
             output += f", {count_unchanged} unchanged"
         print(output)
+
+        if not last_msg_id:
+            # assume we're up to date if we don't know the last message ID
+            break
+
+        # Otherwise, double check that we have the last message
+        retries += 1
+        last_msg_exists = os.path.exists(os.path.join(chat_dir, sanitize_filename(f"msg_{last_msg_id}.json")))
+        if not last_msg_exists and retries < max_retries:
+            print("  Last message still not downloaded, rechecking all messages")
+        elif not last_msg_exists:
+            print("  Error: Giving up on downloading messages for this chat")
     else:
         print("  No new messages in the chat since last run")
 
