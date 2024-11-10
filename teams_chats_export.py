@@ -17,9 +17,11 @@ import kiota_serialization_json
 import kiota_serialization_json.json_parse_node_factory
 import kiota_serialization_json.json_serialization_writer_factory
 from msgraph.graph_service_client import GraphServiceClient
+from kiota_abstractions.base_request_configuration import RequestConfiguration
 from msgraph.generated.models.chat import Chat # type: ignore
 from msgraph.generated.models.chat_message import ChatMessage # type: ignore
 from msgraph.generated.models.chat_message_attachment import ChatMessageAttachment # type: ignore
+from msgraph.generated.models.o_data_errors.o_data_error import ODataError # type: ignore
 from msgraph.generated.users.item.chats.chats_request_builder import ChatsRequestBuilder # type: ignore
 from msgraph.generated.users.item.chats.item.messages.messages_request_builder import MessagesRequestBuilder # type: ignore
 from kiota_abstractions.api_error import APIError
@@ -100,14 +102,14 @@ def get_hosted_content_id(attachment: ChatMessageAttachment) -> str:
     return hosted_content_id
 
 @overload
-async def fetch_all_for_request(getable: ChatsRequestBuilder, request_config: ChatsRequestBuilder.ChatsRequestBuilderGetRequestConfiguration) -> Generator[tuple[Chat, int], Any, None]:
+async def fetch_all_for_request(getable: ChatsRequestBuilder, request_config: RequestConfiguration[ChatsRequestBuilder.ChatsRequestBuilderGetQueryParameters] | None) -> Generator[tuple[Chat, int], Any, None]:
     ...
 
 @overload
-async def fetch_all_for_request(getable: MessagesRequestBuilder, request_config: MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration) -> Generator[tuple[ChatMessage, int], Any, None]:
+async def fetch_all_for_request(getable: MessagesRequestBuilder, request_config: RequestConfiguration[MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters] | None) -> Generator[tuple[ChatMessage, int], Any, None]:
     ...
 
-async def fetch_all_for_request(getable: ChatsRequestBuilder | MessagesRequestBuilder, request_config: ChatsRequestBuilder.ChatsRequestBuilderGetRequestConfiguration | MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration):
+async def fetch_all_for_request(getable: ChatsRequestBuilder | MessagesRequestBuilder, request_config: RequestConfiguration[ChatsRequestBuilder.ChatsRequestBuilderGetQueryParameters] | RequestConfiguration[MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters] | None):
     """
     returns an iterator over the dict records returned from a request
 
@@ -191,6 +193,12 @@ async def download_sharepoint_document(client: GraphServiceClient, url: str, cha
         makedir(os.path.dirname(path))
         with open(path, "wb") as f:
             f.write(content_bytes)
+    except ODataError as e:
+        if e.error and e.error.message and "The sharing link no longer exists" in e.error.message:
+            print(f"  Warn: The sharing link for {url} no longer exists")
+            path = None
+        else:
+            raise e
     except APIError as e:
         # If the sharing link no longer exists, just warn and continue, can't do
         # anything about it
@@ -258,6 +266,7 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
     by default, only newer messages are downloaded.
     """
     if chat.id is None:
+        print("  Skipping chat with no id")
         return
 
     async def save_msg(msg: ChatMessage, path: str):
@@ -270,26 +279,28 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
         with open(path, "wb") as f:
             f.write(kiota_writer.get_serialized_content())
 
+    # This logic isn't perfect, since we would redownload all messages even if
+    # we were kept up to date, if the last message was deleted (since the last
+    # message ID would not be found as a file). Also, some old chats don't have
+    # last_message_preview set, leading to a re-download every run. But it's
+    # good enough for now.
     last_msg_id = chat.last_message_preview.id if chat.last_message_preview is not None else None
     last_msg_exists = os.path.exists(os.path.join(chat_dir, sanitize_filename(f"msg_{last_msg_id}.json")))
     if force or not last_msg_id or not last_msg_exists:
+        if not last_msg_id:
+            print("  Could not determine last message ID, checking all messages")
+        elif not last_msg_exists:
+            print("  Last message not downloaded, checking all messages")
+        else:
+            print("  Force flag set, checking and downloading all messages")
         count_saved = 0
         count_updated = 0
         count_unchanged = 0
         messages_request = client.me.chats.by_chat_id(chat.id).messages
 
-        query_params = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
-            top=50,
-        )
-        request_config = (
-            MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration(
-                query_parameters=query_params,
-            )
-        )
-
         print(f"  Message 0/0", end="\r")
         i = 0
-        async for msg, remaining in fetch_all_for_request(messages_request, request_config):
+        async for msg, remaining in fetch_all_for_request(messages_request, None):
             i += 1
             print(f"  Message {i}/{i + remaining}", end="\r")
 
@@ -298,31 +309,31 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
                 await save_msg(msg, path)
                 count_saved += 1
             else:
-                # if incoming msg was deleted, we don't want to overwrite our file
                 if not msg.deleted_date_time:
-                    with open(path, "r") as f:
-                        existing_msg = json.loads(f.read())
+                    # Incoming message hasn't been deleted, and we have a file for it
+                    with open(path, "rb") as f:
+                        kiota_factory = kiota_serialization_json.json_parse_node_factory.JsonParseNodeFactory()
+                        kiota_parsenode = kiota_factory.get_root_parse_node(kiota_factory.get_valid_content_type(), f.read())
+                        existing_msg = kiota_parsenode.get_object_value(ChatMessage.create_from_discriminator_value(kiota_parsenode))
 
-                    # save edited/modified msgs
                     if (
-                        existing_msg["lastModifiedDateTime"]
+                        existing_msg.last_modified_date_time
                         != msg.last_modified_date_time
-                        or existing_msg["lastEditedDateTime"]
+                        or existing_msg.last_edited_date_time
                         != msg.last_edited_date_time
+                        or force
                     ):
+                        # save edited/modified msgs
                         await save_msg(msg, path)
                         count_updated += 1
                     else:
                         count_unchanged += 1
-                        # msg exists but hasn't been edited/modified, so we can stop
-                        # if we're not running in force mode
-                        if not force:
-                            break
                 else:
+                    # if incoming msg was deleted, we don't want to overwrite our file
                     count_unchanged += 1
 
         output = f"  Message counts: {count_saved} saved, {count_updated} updated"
-        if force:
+        if not force:
             output += f", {count_unchanged} unchanged"
         print(output)
     else:
@@ -331,8 +342,6 @@ async def download_messages(client: GraphServiceClient, chat: Chat, chat_dir: st
 
 async def download_chat(client: GraphServiceClient, chat: Chat, data_dir: str, force: bool):
     """download a single chat and its associated data (messages, attachments)"""
-    print(f"Processing chat {get_chat_name(chat)} (id {chat.id})")
-
     if chat.id is None:
         print("  Skipping chat with no id")
         return
@@ -365,13 +374,12 @@ async def download_all(output_dir: str, force: bool):
     query_params = ChatsRequestBuilder.ChatsRequestBuilderGetQueryParameters(
         expand=["members", "lastMessagePreview"], top=50
     )
-    request_config = ChatsRequestBuilder.ChatsRequestBuilderGetRequestConfiguration(
-        query_parameters=query_params,
-    )
+    request_config = RequestConfiguration(query_parameters=query_params)
     i = 0
     async for chat, remaining in fetch_all_for_request(client.me.chats, request_config):
         i += 1
-        print(f"Downloading chat {i}/{i + remaining}")
+        print(f"Processing chat {i}/{i + remaining}: {get_chat_name(chat)} (id {chat.id})")
+
         await download_chat(client, chat, data_dir, force)
 
 
