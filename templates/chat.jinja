@@ -61,8 +61,8 @@
         {% set msg = msg_dict.obj %}
         <div data-msg-id="{{ msg.id }}">
             <span class="from">
-            {%- if msg.from and msg.from.user -%}
-                {{ msg.from.user.displayName }}
+            {%- if msg.from_ and msg.from_.user -%}
+                {{ msg.from_.user.display_name }}
             {%- else -%}
                 Unknown
             {%- endif -%}
@@ -70,9 +70,9 @@
             <span  class="timestamp">{{ msg.created_date_time|localdt }}</span>
         </div>
         <div class="message-content">
-            {%- if msg.eventDetail -%}
-                <p>{{ msg.eventDetail['@odata.type'] }}</p>
-            {%- elif msg.deletedDateTime -%}
+            {%- if msg.event_detail -%}
+                <p>{{ msg.event_detail.odata_type }}</p>
+            {%- elif msg.deleted_date_time -%}
                 <p><em>(MESSAGE DELETED)</em></p>
             {%- else -%}
                 {{ msg_dict.content }}
