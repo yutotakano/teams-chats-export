@@ -224,6 +224,13 @@ async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat,
     # A value of None means the download was attempted but unsuccessful.
     attachments_map: dict[str, str | None] = {}
 
+    # Load existing map, from other messages in this chat
+    try:
+        with open(os.path.join(chat_dir, "attachments_map.json"), "r") as f:
+            attachments_map = json.loads(f.read())
+    except FileNotFoundError:
+        pass
+
     if msg.attachments:
         for attachment in msg.attachments:
             if attachment.content_type == "application/vnd.microsoft.card.codesnippet":
