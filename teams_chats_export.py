@@ -20,6 +20,7 @@ from msgraph.graph_service_client import GraphServiceClient
 from kiota_abstractions.base_request_configuration import RequestConfiguration
 from msgraph.generated.models.chat import Chat # type: ignore
 from msgraph.generated.models.chat_message import ChatMessage # type: ignore
+from msgraph.generated.models.body_type import BodyType # type: ignore
 from msgraph.generated.models.chat_message_attachment import ChatMessageAttachment # type: ignore
 from msgraph.generated.models.o_data_errors.o_data_error import ODataError # type: ignore
 from msgraph.generated.users.item.chats.chats_request_builder import ChatsRequestBuilder # type: ignore
@@ -216,8 +217,6 @@ async def download_sharepoint_document(client: GraphServiceClient, url: str, cha
 
 async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat, msg: ChatMessage, chat_dir: str):
     # fetch all the "hosted contents" (inline attachments)
-    if not msg.attachments:
-        return
 
     # Mapping from attachment ID to filepath, for attachments that are downloaded
     # This is necessary since otherwise when rendering we can't tell which
@@ -225,19 +224,20 @@ async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat,
     # A value of None means the download was attempted but unsuccessful.
     attachments_map: dict[str, str | None] = {}
 
-    for attachment in msg.attachments:
-        if attachment.content_type == "application/vnd.microsoft.card.codesnippet":
-            hosted_content_id = get_hosted_content_id(attachment)
-            await download_hosted_content(
-                client, chat, msg, hosted_content_id, chat_dir
-            )
-        elif attachment.content_type == "reference" and attachment.id and attachment.content_url:
-            # Download referenced attachments by URL too, as i hate SharePoint
-            url = attachment.content_url
-            matches = re.findall(r"https://([a-z0-9-]+)\.sharepoint\.com", url)
-            if matches:
-                local_path = await download_sharepoint_document(client, url, chat_dir)
-                attachments_map[attachment.id] = local_path
+    if msg.attachments:
+        for attachment in msg.attachments:
+            if attachment.content_type == "application/vnd.microsoft.card.codesnippet":
+                hosted_content_id = get_hosted_content_id(attachment)
+                await download_hosted_content(
+                    client, chat, msg, hosted_content_id, chat_dir
+                )
+            elif attachment.content_type == "reference" and attachment.id and attachment.content_url:
+                # Download referenced attachments by URL too, as i hate SharePoint
+                url = attachment.content_url
+                matches = re.findall(r"https://([a-z0-9-]+)\.sharepoint\.com", url)
+                if matches:
+                    local_path = await download_sharepoint_document(client, url, chat_dir)
+                    attachments_map[attachment.id] = local_path
 
     # Save the attachment map to the message file
     with open(os.path.join(chat_dir, "attachments_map.json"), "w") as f:
@@ -246,7 +246,7 @@ async def download_hosted_content_in_msg(client: GraphServiceClient, chat: Chat,
     # images are not present as attachments, just referenced in img tags
     content_type = msg.body.content_type if msg.body and msg.body.content_type else ""
     content = msg.body.content if msg.body and msg.body.content else ""
-    if content_type == "html":
+    if content_type == BodyType.Html:
         for match in re.findall('src="(.+?)"', content):
             url = match
             if "https://graph.microsoft.com/v1.0/chats/" in url:
