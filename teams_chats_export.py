@@ -419,7 +419,7 @@ def render_message_body(msg: ChatMessage, chat_dir: str, html_dir: str) -> Optio
         attachment = [a for a in msg.attachments if a.id == attachment_id][0]
         if attachment.content_type == "reference" and attachment.id:
             if attachments_map.get(attachment.id):
-                return f"<div class='attachment' data-attachment-id='{attachment.id}'><a href='{attachments_map.get(attachment.id)}'>{attachment.name}</a></div>"
+                return f"<div class='attachment' data-attachment-id='{attachment.id}'><a href='../../{attachments_map.get(attachment.id)}'>{attachment.name}</a></div>"
             else:
                 return f"<div class='attachment' data-attachment-id='{attachment.id}'><a href='{attachment.content_url}'>{attachment.name}</a> (not locally available)</div>"
 
